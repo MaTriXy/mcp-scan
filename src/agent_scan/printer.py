@@ -1,0 +1,355 @@
+import builtins
+
+import rich
+from mcp.types import Prompt, Resource, ResourceTemplate, Tool
+from rich.text import Text
+from rich.traceback import Traceback as rTraceback
+from rich.tree import Tree
+
+from agent_scan.models import (
+    Entity,
+    Issue,
+    ScanError,
+    ScanPathResult,
+    ToxicFlowExtraData,
+)
+
+MAX_ENTITY_NAME_LENGTH = 25
+MAX_ENTITY_NAME_LENGTH_SKILL = 35
+MAX_ENTITY_NAME_TOXIC_FLOW_LENGTH = 30
+
+ISSUE_COLOR_MAP = {
+    "successful": "[green]",
+    "issue": "[red]",
+    "analysis_error": "[gray62]",
+    "warning": "[yellow]",
+    "inspect_mode": "[white]",
+}
+
+
+def format_exception(e: Exception | str | None) -> tuple[str, rTraceback | None]:
+    if e is None:
+        return "", None
+    if isinstance(e, str):
+        return e, None
+    name = builtins.type(e).__name__
+    message = str(e).strip()
+    cause = getattr(e, "__cause__", None)
+    context = getattr(e, "__context__", None)
+    parts = [f"{name}: {message}"]
+    if cause is not None:
+        parts.append(f"Caused by: {format_exception(cause)[0]}")
+    if context is not None:
+        parts.append(f"Context: {format_exception(context)[0]}")
+    text = "\n".join(parts)
+    tb = rTraceback.from_exception(builtins.type(e), e, getattr(e, "__traceback__", None))
+    return text, tb
+
+
+def format_error(e: ScanError) -> tuple[str, rTraceback | None]:
+    status, traceback = format_exception(e.exception)
+    if e.message:
+        status = e.message
+    if e.traceback:
+        traceback = e.traceback
+    return status, traceback
+
+
+def format_path_line(path: str, status: str | None, operation: str = "Scanning") -> Text:
+    text = f"● {operation} [bold]{path}[/bold] [gray62]{status or ''}[/gray62]"
+    return Text.from_markup(text)
+
+
+def format_servers_line(server: str, status: str | None = None, issues: list[Issue] | None = None) -> Text:
+    text = f"[bold]{server}[/bold]"
+    gap = 27
+    text += " " * (max(0, gap - len(text)))
+    if status:
+        text += f" [gray62]{status}[/gray62]"
+    if issues:
+        text += format_issues(issues, new_line=True)
+    return Text.from_markup(text)
+
+
+def append_status(status: str, new_status: str) -> str:
+    if status == "":
+        return new_status
+    return f"{new_status}, {status}"
+
+
+def format_issues(issues: list[Issue], new_line: bool = False) -> str:
+    separator = "\n" if new_line else " "
+    status_text = separator.join(
+        [
+            ISSUE_COLOR_MAP["analysis_error"]
+            + rf"● \[{issue.code}]: {issue.message}"
+            + ISSUE_COLOR_MAP["analysis_error"].replace("[", "[/")
+            for issue in issues
+            if issue.code.startswith("X")
+        ]
+        + [
+            ISSUE_COLOR_MAP["issue"]
+            + rf"● \[{issue.code}]: {issue.message}"
+            + ISSUE_COLOR_MAP["issue"].replace("[", "[/")
+            for issue in issues
+            if issue.code.startswith("E")
+        ]
+        + [
+            ISSUE_COLOR_MAP["warning"]
+            + rf"● \[{issue.code}]: {issue.message}"
+            + ISSUE_COLOR_MAP["warning"].replace("[", "[/")
+            for issue in issues
+            if issue.code.startswith("W")
+        ]
+    )
+    if new_line:
+        status_text = "\n" + status_text
+    return status_text
+
+
+def format_entity_type(entity: Entity, is_skill: bool = False) -> str:
+    if isinstance(entity, Prompt):
+        return "prompt" if not is_skill else "instruction"
+    elif isinstance(entity, Tool):
+        return "tool" if not is_skill else "script"
+    elif isinstance(entity, Resource):
+        return "resource" if not is_skill else "asset"
+    elif isinstance(entity, ResourceTemplate):
+        return "res. temp." if not is_skill else "asset"
+    else:
+        raise ValueError(f"Unknown entity type: {type(entity)}")
+
+
+def format_entity_line(
+    entity: Entity,
+    issues: list[Issue],
+    inspect_mode: bool = False,
+    is_skill: bool = False,
+    full_description: bool = False,
+    are_there_server_issues: bool = False,
+) -> Text:
+    # is_verified = verified.value
+    # if is_verified is not None and changed.value is not None:
+    #     is_verified = is_verified and not changed.value
+    if any(issue.code.startswith("X") for issue in issues):
+        status = "analysis_error"
+    elif any(issue.code.startswith("E") for issue in issues):
+        status = "issue"
+    elif any(issue.code.startswith("W") for issue in issues):
+        status = "warning"
+    else:
+        status = "successful"
+
+    icon_map = {
+        "successful": ":white_heavy_check_mark:",
+        "issue": ":cross_mark:",
+        "analysis_error": "",
+        "warning": "⚠️ ",
+        "inspect_mode": "  ",
+    }
+    color = ISSUE_COLOR_MAP[status]
+    icon = icon_map[status]
+    if inspect_mode or are_there_server_issues:
+        color = ISSUE_COLOR_MAP["inspect_mode"]
+        icon = icon_map["inspect_mode"]
+    include_description = status not in ["analysis_error", "successful"] or are_there_server_issues
+
+    # right-pad & truncate name
+    name = entity.name
+    if not full_description:
+        max_name_length = MAX_ENTITY_NAME_LENGTH_SKILL if is_skill else MAX_ENTITY_NAME_LENGTH
+        if len(name) > max_name_length:
+            name = name[: (max_name_length - 3)] + "..."
+        name = name + " " * (max_name_length - len(name))
+
+    # right-pad type
+    type_str = format_entity_type(entity, is_skill)
+    type_str = type_str + " " * (len("instruction") - len(type_str))
+    # prompt     / instruction
+    # tool       / script
+    # resouce    / asset
+    # res. temp. / asset
+
+    status_text = format_issues(issues)
+    text = f"{type_str} {color}[bold]{name}[/bold] {icon} {status_text}"
+
+    if include_description:
+        if hasattr(entity, "description") and entity.description is not None:
+            description = entity.description
+        else:
+            description = "<no description available>"
+        if not full_description:
+            if len(description) > 200:
+                description = (
+                    description[:200]
+                    + f"... {len(description) - 200} characters truncated. Use --print-full-descriptions to see the full description."
+                )
+            else:
+                description = (
+                    description
+                    + f"... {200 - len(description)} characters truncated. Use --print-full-descriptions to see the full description."
+                )
+        # escape markdown in the description
+        description = description.replace("[", r"\[").replace("]", r"\]")
+        text += f"\n[gray62][bold]Current description:[/bold]\n{description}[/gray62]"
+
+    formatted_text = Text.from_markup(text)
+    return formatted_text
+
+
+def format_tool_flow(tool_name: str, server_name: str, value: float) -> Text:
+    text = "{tool_name} {risk}"
+    tool_name = f"{server_name}/{tool_name}"
+    if len(tool_name) > MAX_ENTITY_NAME_TOXIC_FLOW_LENGTH:
+        tool_name = tool_name[: (MAX_ENTITY_NAME_TOXIC_FLOW_LENGTH - 3)] + "..."
+    tool_name = tool_name + " " * (MAX_ENTITY_NAME_TOXIC_FLOW_LENGTH - len(tool_name))
+
+    risk = "[yellow]Low[/yellow]" if value <= 1.5 else "[red]High[/red]"
+    return Text.from_markup(text.format(tool_name=tool_name, risk=risk))
+
+
+def format_global_issue(result: ScanPathResult, issue: Issue, show_all: bool = False) -> Tree:
+    """
+    Format issues about the whole scan.
+    """
+    assert issue.reference is None, "Global issues should not have a reference"
+    # assert issue.code in ["TF001", "TF002", "W002"] , (
+    #     f"Only issues with code TF001, TF002 or W002 can be global issues. {issue.code}"
+    # )
+    tree = Tree(f"[yellow]\n⚠️ [{issue.code}]: {issue.message}[/yellow]")
+
+    def _format_tool_kind_name(tool_kind_name: str) -> str:
+        return " ".join(tool_kind_name.split("_")).title()
+
+    def _format_tool_name(server_name: str, tool_name: str, value: float) -> str:
+        tool_string = f"{server_name}/{tool_name}"
+        if len(tool_string) > MAX_ENTITY_NAME_TOXIC_FLOW_LENGTH:
+            tool_string = tool_string[: (MAX_ENTITY_NAME_TOXIC_FLOW_LENGTH - 3)] + "..."
+        tool_string = tool_string + " " * (MAX_ENTITY_NAME_TOXIC_FLOW_LENGTH - len(tool_string))
+        if value <= 1.5:
+            severity = "[yellow]Low[/yellow]"
+        elif value <= 2.5:
+            severity = "[red]High[/red]"
+        else:
+            severity = "[bold][red]Critical[/red][/bold]"
+        return f"{tool_string} {severity}"
+
+    if not issue.code.startswith("TF"):
+        return tree
+
+    try:
+        extra_data = ToxicFlowExtraData.model_validate(issue.extra_data)
+    except Exception:
+        tree.add("[gray62]Invalid extra data format[/gray62]")
+        return tree
+
+    for tool_kind_name, tool_references in extra_data.root.items():
+        tool_references.sort(key=lambda x: x.label_value, reverse=True)
+        tool_tree = tree.add(f"[bold]{_format_tool_kind_name(tool_kind_name)}[/bold]")
+        for tool_reference in tool_references[: 3 if not show_all else None]:
+            tool_tree.add(
+                _format_tool_name(
+                    result.servers[tool_reference.reference[0]].name if result.servers is not None else "",
+                    result.servers[tool_reference.reference[0]].signature.entities[tool_reference.reference[1]].name
+                    if result.servers is not None
+                    else "",
+                    tool_reference.label_value,
+                )
+            )
+        if len(tool_references) > 3 and not show_all:
+            tool_tree.add(
+                f"[gray62]... and {len(tool_references) - 3} more tools (to see all, use --full-toxic-flows)[/gray62]"
+            )
+    return tree
+
+
+def print_scan_path_result(
+    result: ScanPathResult,
+    print_errors: bool = False,
+    full_toxic_flows: bool = False,
+    inspect_mode: bool = False,
+    full_description: bool = False,
+) -> None:
+    if result.error is not None:
+        err_status, traceback = format_error(result.error)
+        rich.print(format_path_line(result.path, err_status))
+        if print_errors and traceback is not None:
+            console = rich.console.Console()
+            console.print(traceback)
+        return
+
+    server_count = 0
+    skill_count = 0
+    for server in result.servers or []:
+        if server.server.type == "skill":
+            skill_count += 1
+        else:
+            server_count += 1
+    if server_count > 0 and skill_count > 0:
+        message = f"found {server_count} mcp server{'' if server_count == 1 else 's'} and {skill_count} skill{'' if skill_count == 1 else 's'}"
+    elif server_count > 0:
+        message = f"found {server_count} mcp server{'' if server_count == 1 else 's'}"
+    elif skill_count > 0:
+        message = f"found {skill_count} skill{'' if skill_count == 1 else 's'}"
+    else:
+        message = "no servers or skills found"
+    rich.print(format_path_line(result.path, message))
+    path_print_tree = Tree("│")
+    server_tracebacks = []
+    for server_idx, server in enumerate(result.servers or []):
+        server_issues = [issue for issue in result.issues if issue.reference == (server_idx, None)]
+        if server.error is not None:
+            err_status, traceback = format_error(server.error)
+            server_print = path_print_tree.add(
+                format_servers_line(server.name or "", issues=server_issues, status=err_status)
+            )
+            if traceback is not None:
+                server_tracebacks.append((server, traceback))
+        else:
+            server_print = path_print_tree.add(format_servers_line(server.name or "", None, server_issues))
+        for entity_idx, entity in enumerate(server.entities):
+            issues = [issue for issue in result.issues if issue.reference == (server_idx, entity_idx)]
+            server_print.add(
+                format_entity_line(
+                    entity,
+                    issues,
+                    inspect_mode,
+                    is_skill=server.server.type == "skill",
+                    full_description=full_description,
+                    are_there_server_issues=bool(server_issues),
+                )
+            )
+
+    if result.servers is not None and len(result.servers) > 0:
+        rich.print(path_print_tree)
+
+    # print global issues
+    for issue in result.issues:
+        if issue.reference is None:
+            rich.print(format_global_issue(result, issue, full_toxic_flows))
+
+    if print_errors and len(server_tracebacks) > 0:
+        console = rich.console.Console()
+        for server, traceback in server_tracebacks:
+            console.print()
+            console.print("[bold]Exception when scanning " + (server.name or "") + "[/bold]")
+            console.print(traceback)
+    print(end="", flush=True)
+
+
+def print_scan_result(
+    result: list[ScanPathResult],
+    print_errors: bool = False,
+    full_toxic_flows: bool = False,
+    inspect_mode: bool = False,
+    internal_issues: bool = False,
+    full_description: bool = False,
+) -> None:
+    if not internal_issues:
+        for res in result:
+            res.issues = [issue for issue in res.issues if issue.code not in ["W003", "W004", "W005", "W006"]]
+    for i, path_result in enumerate(result):
+        print_scan_path_result(path_result, print_errors, full_toxic_flows, inspect_mode, full_description)
+        if i < len(result) - 1:
+            rich.print()
+    print(end="", flush=True)
